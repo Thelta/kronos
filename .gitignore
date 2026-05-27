@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+*.log
+dist/
+build/
+outputs/
+.pycache_tmp
+samples
+training_runs

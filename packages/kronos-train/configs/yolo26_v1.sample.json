@@ -1,0 +1,39 @@
+{
+  "dataset": {
+    "output_dir": "D:/projects/kronos/training_runs/yolo26_dataset",
+    "synthetic_images_dir": "D:\\kronos-training\\portrait-detection\\images",
+    "synthetic_labels_dir": "D:\\kronos-training\\portrait-detection\\labels",
+    "reviewed_real_dir": "C:/Users/atilh/Desktop/re123/labeled_real_data/review",
+    "review_status_file": "C:/Users/atilh/Desktop/re123/labeled_real_data/review/review_status.json",
+    "class_names": [
+      "portrait"
+    ],
+    "train_split": 0.8,
+    "seed": 7,
+    "include_review_statuses": [
+      "accepted",
+      "rejected"
+    ],
+    "synthetic_image_patterns": [
+      "*.jpg",
+      "*.png"
+    ],
+    "reviewed_real_image_patterns": [
+      "*_orig.jpg"
+    ]
+  },
+  "trainer": {
+    "weights": "C:/Users/atilh/Desktop/re123/yolo26n.pt",
+    "epochs": 100,
+    "imgsz": 1280,
+    "batch": 16,
+    "patience": 15,
+    "device": "cuda",
+    "project": "D:/projects/kronos/training_runs/yolo",
+    "name": "portrait_merged_yolo26n",
+    "save": true,
+    "plots": true,
+    "exist_ok": true,
+    "verbose": true
+  }
+}

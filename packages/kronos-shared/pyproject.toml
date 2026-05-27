@@ -1,0 +1,11 @@
+[project]
+name = "kronos-shared"
+version = "0.1.0"
+description = "Lightweight shared schemas for Kronos training and runtime artifacts."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

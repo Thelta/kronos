@@ -1,0 +1,59 @@
+{
+  "data": {
+    "manifest_path": "artifacts/synthetic/manifest.jsonl",
+    "image_size": 224,
+    "batch_size": 32,
+    "num_workers": 2,
+    "train_subset": "train",
+    "val_subset": "val",
+    "test_subset": "test",
+    "gallery_subset": "gallery",
+    "gallery_count_per_identity": 2,
+    "pin_memory": true,
+    "tiny_card_degrade_prob": 0.7,
+    "tiny_card_size_jitter": 0.12,
+    "tiny_card_sizes": [[63, 50], [75, 60], [76, 59], [62, 58], [90, 72], [110, 88]]
+  },
+  "model": {
+    "model_name": "mobilenetv4_conv_small.e2400_r224_in1k",
+    "pretrained": true,
+    "embedding_dim": 256,
+    "star_roi": [0.0, 0.68, 0.38, 1.0],
+    "assist_roi": [0.68, 0.0, 1.0, 0.32],
+    "star_box_expand_x": 0.2,
+    "star_box_expand_y": 0.35,
+    "star_box_train_prob": 0.7,
+    "star_box_jitter": 0.12,
+    "roi_hidden_dim": 128,
+    "roi_input_size": 192,
+    "star_lowres_prob": 0.65,
+    "star_lowres_min_size": 16,
+    "star_lowres_max_size": 28,
+    "star_sequence_bins": 10,
+    "star_locator_bins": 16,
+    "star_strip_min_width": 0.35,
+    "star_strip_max_width": 0.85
+  },
+  "arcface": {
+    "margin": 0.3,
+    "scale": 32.0
+  },
+  "optimizer": {
+    "lr": 0.0003,
+    "weight_decay": 0.0001,
+    "min_lr": 1e-05
+  },
+  "losses": {
+    "identity_weight": 1.0,
+    "star_weight": 0.3,
+    "star_color_weight": 0.2,
+    "assist_weight": 0.2
+  },
+  "trainer": {
+    "epochs": 10,
+    "mixed_precision": "fp32",
+    "output_dir": "training_runs/kronos_arcface",
+    "resume_from": null,
+    "seed": 7
+  }
+}

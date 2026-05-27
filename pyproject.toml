@@ -1,0 +1,31 @@
+[project]
+name = "kronos-analyzer"
+version = "0.1.0"
+description = "Simple RapidOCR dump pipeline."
+readme = "README.md"
+authors = [
+    { name = "Atılhan Emre Dursunoğlu", email = "atilhandursunoglu@outlook.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "av>=17.0.1",
+    "kronos-shared",
+    "opencv-python-headless>=4.10.0",
+    "onnxruntime>=1.18.0",
+    "rapidocr>=3.4.0",
+    "rapidfuzz>=3.10.0",
+    "onnxruntime-gpu[cuda,cudnn]>=1.26.0",
+]
+
+[tool.uv.sources]
+kronos-shared = { workspace = true }
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[project.scripts]
+kronos-analyzer = "kronos_analyzer.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
