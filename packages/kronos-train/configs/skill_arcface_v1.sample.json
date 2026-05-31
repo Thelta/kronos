@@ -1,0 +1,42 @@
+{
+  "data": {
+    "manifest_path": "artifacts/synthetic/skill_manifest.jsonl",
+    "image_size": 224,
+    "batch_size": 128,
+    "num_workers": 2,
+    "train_sampler": "balanced_identity_mode",
+    "train_subset": "train",
+    "val_subset": "val",
+    "test_subset": "test",
+    "gallery_subset": "gallery",
+    "gallery_count_per_identity": 2,
+    "pin_memory": true
+  },
+  "model": {
+    "model_name": "mobilenetv4_conv_small.e2400_r224_in1k",
+    "pretrained": true,
+    "embedding_dim": 256,
+    "head_hidden_dim": 128
+  },
+  "arcface": {
+    "margin": 0.3,
+    "scale": 32.0
+  },
+  "optimizer": {
+    "lr": 0.0003,
+    "weight_decay": 0.0001,
+    "min_lr": 1e-05
+  },
+  "losses": {
+    "identity_weight": 1.0,
+    "empty_weight": 0.2
+  },
+  "trainer": {
+    "epochs": 100,
+    "patience": 10,
+    "mixed_precision": "fp32",
+    "output_dir": "training_runs/kronos_skill_arcface",
+    "resume_from": null,
+    "seed": 7
+  }
+}

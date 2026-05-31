@@ -47,6 +47,7 @@ def make_raid(
     timer: str,
     remaining_hp: int | None,
     total_hp: int | None = 1000,
+    cost: int | None = None,
 ) -> SceneObservation:
     return SceneObservation(
         frame_index=frame_index,
@@ -56,6 +57,7 @@ def make_raid(
             boss_remaining_hp=remaining_hp,
             boss_total_hp=total_hp,
             timer=timer,
+            cost=cost,
         ),
     )
 
@@ -164,6 +166,32 @@ class SessionAggregatorTests(unittest.TestCase):
         self.assertEqual(len(samples), 1)
         self.assertEqual(samples[0].frame_index, 3)
         self.assertEqual(samples[0].boss_remaining_hp, 980)
+
+    def test_duplicate_timer_prefers_sample_with_cost_on_quality_tie(self) -> None:
+        summary = aggregate_session(
+            [
+                make_raid(1, 1000, "00:50.000", 1000, 1000, None),
+                make_raid(2, 2000, "00:50.000", 1000, 1000, 3),
+                make_result(3, 3000),
+            ]
+        )
+
+        assert summary is not None
+        samples = summary.team_segments[0].raid_timeline
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0].frame_index, 2)
+        self.assertEqual(samples[0].cost, 3)
+
+    def test_raid_timeline_carries_cost(self) -> None:
+        summary = aggregate_session(
+            [
+                make_raid(1, 1000, "00:50.000", 1000, 1000, -11),
+                make_result(2, 2000),
+            ]
+        )
+
+        assert summary is not None
+        self.assertEqual(summary.team_segments[0].raid_timeline[0].cost, -11)
 
     def test_segment_damage_resets_while_session_damage_stays_cumulative(self) -> None:
         summary = aggregate_session(

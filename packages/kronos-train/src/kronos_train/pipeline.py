@@ -12,6 +12,8 @@ from .data import (
     SyntheticCardDataset,
     build_identity_index,
     collate_samples,
+    ensure_empty_examples,
+    is_empty_row,
     load_rows,
     prepare_runtime_subsets,
 )
@@ -37,6 +39,7 @@ def build_loaders(config: TrainConfig) -> tuple[Any, Any, Any, list[str], Path]:
     manifest_path = Path(config.data.manifest_path)
     dataset_root = manifest_path.parent
     rows = load_rows(manifest_path)
+    ensure_empty_examples(rows)
     identities = build_identity_index(rows)
     character_to_index = {character_id: index for index, character_id in enumerate(identities)}
     prepared = prepare_runtime_subsets(
@@ -87,6 +90,7 @@ def build_query_loader(config: TrainConfig, subset: str) -> tuple[Any, Any, list
     manifest_path = Path(config.data.manifest_path)
     dataset_root = manifest_path.parent
     rows = load_rows(manifest_path)
+    ensure_empty_examples(rows)
     identities = build_identity_index(rows)
     character_to_index = {character_id: index for index, character_id in enumerate(identities)}
     prepared = prepare_runtime_subsets(
@@ -142,6 +146,8 @@ def move_batch_to_device(batch: dict[str, Any], device: Any) -> dict[str, Any]:
     moved = {
         "images": batch["images"].to(device, non_blocking=True),
         "identity_indices": batch["identity_indices"].to(device, non_blocking=True),
+        "empty_labels": batch["empty_labels"].to(device, non_blocking=True),
+        "non_empty_mask": batch["non_empty_mask"].to(device, non_blocking=True),
         "star_indices": batch["star_indices"].to(device, non_blocking=True),
         "star_color_indices": batch["star_color_indices"].to(device, non_blocking=True),
         "star_state_indices": batch["star_state_indices"].to(device, non_blocking=True),
@@ -157,16 +163,26 @@ def move_batch_to_device(batch: dict[str, Any], device: Any) -> dict[str, Any]:
 def compute_losses(config: TrainConfig, outputs: dict[str, Any], batch: dict[str, Any]) -> tuple[Any, dict[str, float]]:
     import torch.nn.functional as F
 
-    identity_loss = F.cross_entropy(outputs["identity_logits"], batch["identity_indices"])
-    star_loss = F.cross_entropy(outputs["star_state_logits"], batch["star_state_indices"])
-    assist_loss = F.binary_cross_entropy_with_logits(outputs["assist_logits"], batch["assist"])
+    non_empty_mask = batch["non_empty_mask"]
+    zero = outputs["empty_logits"].new_zeros(())
+    empty_loss = F.binary_cross_entropy_with_logits(outputs["empty_logits"], batch["empty_labels"])
+    if bool(non_empty_mask.any().item()):
+        identity_loss = F.cross_entropy(outputs["identity_logits"][non_empty_mask], batch["identity_indices"][non_empty_mask])
+        star_loss = F.cross_entropy(outputs["star_state_logits"][non_empty_mask], batch["star_state_indices"][non_empty_mask])
+        assist_loss = F.binary_cross_entropy_with_logits(outputs["assist_logits"][non_empty_mask], batch["assist"][non_empty_mask])
+    else:
+        identity_loss = zero
+        star_loss = zero
+        assist_loss = zero
     total = (
         config.losses.identity_weight * identity_loss
+        + config.losses.empty_weight * empty_loss
         + (config.losses.star_weight + config.losses.star_color_weight) * star_loss
         + config.losses.assist_weight * assist_loss
     )
     return total, {
         "identity_loss": float(identity_loss.detach().cpu()),
+        "empty_loss": float(empty_loss.detach().cpu()),
         "star_loss": float(star_loss.detach().cpu()),
         "assist_loss": float(assist_loss.detach().cpu()),
     }
@@ -192,13 +208,14 @@ def train_one_epoch(
         else contextlib.nullcontext()
     )
 
-    totals = {"loss": 0.0, "identity_loss": 0.0, "star_loss": 0.0, "assist_loss": 0.0}
+    totals = {"loss": 0.0, "identity_loss": 0.0, "empty_loss": 0.0, "star_loss": 0.0, "assist_loss": 0.0}
     total_items = 0
     for batch in loader:
         batch = move_batch_to_device(batch, device)
+        safe_identity_indices = batch["identity_indices"].masked_fill(~batch["non_empty_mask"], 0)
         optimizer.zero_grad(set_to_none=True)
         with autocast_context():
-            outputs = model(batch["images"], batch["identity_indices"], batch["card_boxes"], batch["star_boxes"])
+            outputs = model(batch["images"], safe_identity_indices, batch["card_boxes"], batch["star_boxes"])
             loss, parts = compute_losses(config, outputs, batch)
         if scaler is not None and scaler.is_enabled():
             scaler.scale(loss).backward()
@@ -211,7 +228,7 @@ def train_one_epoch(
         batch_size = batch["images"].shape[0]
         total_items += batch_size
         totals["loss"] += float(loss.detach().cpu()) * batch_size
-        for key in ("identity_loss", "star_loss", "assist_loss"):
+        for key in ("identity_loss", "empty_loss", "star_loss", "assist_loss"):
             totals[key] += parts[key] * batch_size
 
     return {key: value / total_items for key, value in totals.items()}
@@ -241,6 +258,8 @@ def compute_gallery_embeddings(model: Any, loader: Any, identities: list[str], d
 
 
 def row_tags(row: SyntheticClassificationRow) -> list[str]:
+    if is_empty_row(row):
+        return []
     tags = ["all", "obstructed" if row.obstructions else "clean"]
     quality = row.quality_policy
     if "blur_radius" in quality:
@@ -267,6 +286,11 @@ def evaluate_retrieval(
 
     model.eval()
     counters: dict[str, dict[str, float]] = {}
+    empty_total = 0.0
+    empty_correct = 0.0
+    empty_true = 0.0
+    empty_predicted = 0.0
+    empty_true_positive = 0.0
 
     def ensure(tag: str) -> dict[str, float]:
         if tag not in counters:
@@ -289,20 +313,34 @@ def evaluate_retrieval(
             topk_indices = similarities.topk(k=min(3, len(identities)), dim=1).indices
             star_predictions, star_color_predictions = derive_star_predictions(outputs["star_state_logits"])
             assist_predictions = (outputs["assist_logits"].sigmoid() >= 0.5).long()
+            empty_predictions = (outputs["empty_logits"].sigmoid() >= 0.5).long()
 
             for item_index, row in enumerate(batch["rows"]):
+                row_is_empty = is_empty_row(row)
+                predicted_empty = bool(int(empty_predictions[item_index].detach().cpu()))
+                empty_total += 1.0
+                empty_true += 1.0 if row_is_empty else 0.0
+                empty_predicted += 1.0 if predicted_empty else 0.0
+                empty_true_positive += 1.0 if row_is_empty and predicted_empty else 0.0
+                empty_correct += 1.0 if row_is_empty == predicted_empty else 0.0
+                if row_is_empty:
+                    continue
                 target_character = row.character_id
-                top_characters = [index_to_character[int(index)] for index in topk_indices[item_index]]
-                star_correct = int(int(star_predictions[item_index].detach().cpu()) == int(row.star_value))
-                star_color_correct = int(
-                    int(star_color_predictions[item_index].detach().cpu())
-                    == (1 if row.star_color.strip().lower() == "blue" else 0)
-                )
-                assist_correct = int(int(assist_predictions[item_index].detach().cpu()) == int(bool(row.assist)))
+                top_characters = [] if predicted_empty else [index_to_character[int(index)] for index in topk_indices[item_index]]
+                star_correct = 0
+                star_color_correct = 0
+                assist_correct = 0
+                if not predicted_empty:
+                    star_correct = int(int(star_predictions[item_index].detach().cpu()) == int(row.star_value))
+                    star_color_correct = int(
+                        int(star_color_predictions[item_index].detach().cpu())
+                        == (1 if (row.star_color or "").strip().lower() == "blue" else 0)
+                    )
+                    assist_correct = int(int(assist_predictions[item_index].detach().cpu()) == int(bool(row.assist)))
                 for tag in row_tags(row):
                     bucket = ensure(tag)
                     bucket["count"] += 1.0
-                    bucket["top1"] += 1.0 if top_characters[0] == target_character else 0.0
+                    bucket["top1"] += 1.0 if top_characters and top_characters[0] == target_character else 0.0
                     bucket["top3"] += 1.0 if target_character in top_characters else 0.0
                     bucket["star"] += float(star_correct)
                     bucket["star_color"] += float(star_color_correct)
@@ -319,6 +357,14 @@ def evaluate_retrieval(
         }
         for tag, values in counters.items()
         if values["count"] > 0
+    }
+    precision = empty_true_positive / empty_predicted if empty_predicted > 0 else 0.0
+    recall = empty_true_positive / empty_true if empty_true > 0 else 0.0
+    metrics["empty"] = {
+        "count": int(empty_total),
+        "accuracy": empty_correct / empty_total if empty_total > 0 else 0.0,
+        "precision": precision,
+        "recall": recall,
     }
     metrics["gallery_sample_count"] = prototype_counts
     return metrics
@@ -461,6 +507,7 @@ def export_gallery(checkpoint_path: Path, output_path: Path, device_name: str) -
     manifest_path = Path(config.data.manifest_path)
     dataset_root = manifest_path.parent
     rows = load_rows(manifest_path)
+    ensure_empty_examples(rows)
     character_to_index = {character_id: index for index, character_id in enumerate(identities)}
     prepared = prepare_runtime_subsets(
         rows,
@@ -511,6 +558,7 @@ def evaluate_checkpoint(checkpoint_path: Path, subset: str, device_name: str, ou
     manifest_path = Path(config.data.manifest_path)
     dataset_root = manifest_path.parent
     rows = load_rows(manifest_path)
+    ensure_empty_examples(rows)
     character_to_index = {character_id: index for index, character_id in enumerate(identities)}
     prepared = prepare_runtime_subsets(
         rows,
@@ -614,6 +662,8 @@ def dump_star_crops(config: TrainConfig, subset: str, output_dir: Path, limit: i
         images = batch["images"].cpu()
         card_boxes = batch["card_boxes"].cpu()
         for image_tensor, card_box, row in zip(images, card_boxes, batch["rows"]):
+            if is_empty_row(row) or row.star_value is None or row.star_color is None:
+                continue
             crop = crop_with_box(image_tensor, card_box.tolist())
             crop = (crop * std) + mean
             crop = crop.clamp(0.0, 1.0)
@@ -663,6 +713,7 @@ def predict_image(
     manifest_path = Path(config.data.manifest_path)
     dataset_root = manifest_path.parent
     rows = load_rows(manifest_path)
+    ensure_empty_examples(rows)
     character_to_index = {character_id: index for index, character_id in enumerate(identities)}
     prepared = prepare_runtime_subsets(
         rows,
@@ -673,6 +724,46 @@ def predict_image(
         gallery_count_per_identity=config.data.gallery_count_per_identity,
         seed=config.trainer.seed,
     )
+
+    image = pad_image(Image.open(image_path).convert("RGB"), float(pad_ratio), pad_mode)
+    width, height = image.size
+    from .data import build_transforms
+
+    transform = build_transforms(config.data.image_size)
+    image_tensor = transform(image).unsqueeze(0).to(device)
+    scale_x = config.data.image_size / width
+    scale_y = config.data.image_size / height
+    card_box = torch.tensor(
+        [[0.0, 0.0, float(width) * scale_x, float(height) * scale_y]],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    with torch.no_grad():
+        outputs = model(image_tensor, None, card_box, return_debug=dump_dir is not None)
+        empty_probability = float(outputs["empty_logits"].sigmoid().item())
+        predicted_empty = empty_probability >= 0.5
+
+    if predicted_empty:
+        result = {
+            "image": str(image_path),
+            "predicted_character_id": "empty",
+            "predicted_empty": True,
+            "predicted_empty_probability": empty_probability,
+            "predicted_star_state": None,
+            "predicted_star_value": None,
+            "predicted_star_color": None,
+            "predicted_star_confidence": None,
+            "predicted_assist": None,
+            "top_star_states": [],
+            "top_matches": [],
+        }
+        if dump_dir is not None:
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            image.save(dump_dir / "full.png")
+            (dump_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+        print(json.dumps(result, indent=2))
+        return
 
     from torch.utils.data import DataLoader
 
@@ -692,22 +783,7 @@ def predict_image(
     )
     prototypes, _ = compute_gallery_embeddings(model, gallery_loader, identities, device)
 
-    image = pad_image(Image.open(image_path).convert("RGB"), float(pad_ratio), pad_mode)
-    width, height = image.size
-    from .data import build_transforms
-
-    transform = build_transforms(config.data.image_size)
-    image_tensor = transform(image).unsqueeze(0).to(device)
-    scale_x = config.data.image_size / width
-    scale_y = config.data.image_size / height
-    card_box = torch.tensor(
-        [[0.0, 0.0, float(width) * scale_x, float(height) * scale_y]],
-        dtype=torch.float32,
-        device=device,
-    )
-
     with torch.no_grad():
-        outputs = model(image_tensor, None, card_box, return_debug=dump_dir is not None)
         similarities = (outputs["embedding"] @ prototypes.T).squeeze(0)
         k = max(1, min(int(topk), len(identities)))
         top_values, top_indices = similarities.topk(k=k)
@@ -721,6 +797,8 @@ def predict_image(
     result = {
         "image": str(image_path),
         "predicted_character_id": identities[int(top_indices[0].item())],
+        "predicted_empty": False,
+        "predicted_empty_probability": empty_probability,
         "predicted_star_state": star_state_label(star_state_index),
         "predicted_star_value": int(star_counts[0].item()),
         "predicted_star_color": "blue" if int(star_colors[0].item()) == 1 else "yellow",

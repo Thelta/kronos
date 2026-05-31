@@ -31,6 +31,7 @@ from kronos_analyzer.video import (  # noqa: E402
     VideoAnalysisResult,
     VideoFrame,
     analyze_video,
+    build_video_analysis_event,
     build_scene_observation,
 )
 
@@ -180,7 +181,17 @@ class VideoPipelineTests(unittest.TestCase):
             self.assertEqual(character_observation.scene, "character_select")
             self.assertEqual(character_observation.students[0].name, "Hoshino")
 
-        raid_dump = make_dump("battle boss total damage")
+        raid_dump = OCRDump(
+            image="frame.png",
+            line_count=4,
+            combined_text="03:24.867\n68,633,666/70,000,000\nCOST\n-11",
+            lines=[
+                OCRLine(text="03:24.867", score=0.99, box=[[2154.0, 66.0], [2357.0, 66.0], [2357.0, 115.0], [2154.0, 115.0]]),
+                OCRLine(text="68,633,666/70,000,000", score=0.99, box=[[1161.0, 106.0], [1469.0, 106.0], [1469.0, 141.0], [1161.0, 141.0]]),
+                OCRLine(text="COST", score=0.99, box=[[1552.0, 1279.0], [1625.0, 1279.0], [1625.0, 1316.0], [1552.0, 1316.0]]),
+                OCRLine(text="-11", score=0.99, box=[[1555.0, 1314.0], [1620.0, 1314.0], [1620.0, 1365.0], [1555.0, 1365.0]]),
+            ],
+        )
         raid_observation = build_scene_observation(
             frame_index=1,
             video_time_ms=1000,
@@ -192,6 +203,8 @@ class VideoPipelineTests(unittest.TestCase):
         )
         self.assertEqual(raid_observation.scene, "raid")
         self.assertIsNotNone(raid_observation.raid)
+        self.assertEqual(raid_observation.raid.cost, -11)
+        self.assertFalse(raid_observation.raid.brightness_recovery_triggered)
 
         result_dump = make_dump("battle complete rankingpoint 戦闘時間 00:10.000")
         result_observation = build_scene_observation(
@@ -384,7 +397,7 @@ class VideoPipelineTests(unittest.TestCase):
                 frame_index=0,
                 video_time_ms=0,
                 scene="raid",
-                scene_payload={"boss_remaining_hp": 1000, "boss_total_hp": 1000, "timer": "00:50.000"},
+                scene_payload={"boss_remaining_hp": 1000, "boss_total_hp": 1000, "timer": "00:50.000", "cost": 3},
                 combined_text="battle boss",
             )
         ]
@@ -417,6 +430,77 @@ class VideoPipelineTests(unittest.TestCase):
             events_payload = json.loads((output_dir / "raid.events.json").read_text(encoding="utf-8"))
             self.assertEqual(session_payload["ranking_point"], 12345)
             self.assertEqual(events_payload[0]["scene"], "raid")
+            self.assertEqual(events_payload[0]["scene_payload"]["cost"], 3)
+
+    def test_build_video_analysis_event_includes_raid_cost(self) -> None:
+        observation = SceneObservation(
+            frame_index=1,
+            video_time_ms=1000,
+            scene="raid",
+            raid=RaidResult(
+                boss_remaining_hp=1000,
+                boss_total_hp=2000,
+                timer="00:50.000",
+                cost=11,
+                brightness_recovery_triggered=True,
+            ),
+        )
+
+        event = build_video_analysis_event(
+            observation=observation,
+            combined_text="battle boss",
+        )
+
+        self.assertEqual(event.scene_payload["cost"], 11)
+        self.assertTrue(event.scene_payload["brightness_recovery_triggered"])
+
+    def test_video_pipeline_emits_brightness_recovery_trigger_on_first_bright_raid_frame(self) -> None:
+        frames = [
+            VideoFrame(
+                frame_index=0,
+                video_time_ms=0,
+                image_name="raid.frame_000000.png",
+                image_array=np.full((8, 8, 3), 60, dtype=np.uint8),
+            ),
+            VideoFrame(
+                frame_index=1,
+                video_time_ms=ANALYSIS_FRAME_INTERVAL_MS,
+                image_name="raid.frame_000001.png",
+                image_array=np.full((8, 8, 3), 120, dtype=np.uint8),
+            ),
+            VideoFrame(
+                frame_index=2,
+                video_time_ms=ANALYSIS_FRAME_INTERVAL_MS * 2,
+                image_name="raid.frame_000002.png",
+                image_array=np.full((8, 8, 3), 130, dtype=np.uint8),
+            ),
+        ]
+        source = SimpleNamespace(iter_frames=lambda video_path: iter(frames))
+        engine = FakeEngine(
+            dumps=[
+                make_dump("battle boss total damage 00:50.000"),
+                make_dump("battle boss total damage 00:48.000"),
+                make_dump("battle boss total damage 00:46.000"),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "raid.mp4"
+            video_path.write_bytes(b"video")
+            with patch(
+                "kronos_analyzer.cli.detect_scene_details",
+                side_effect=[
+                    SimpleNamespace(scene="raid", matched_keywords={}, matched_scenes=["raid"], failure_reason=None),
+                    SimpleNamespace(scene="raid", matched_keywords={}, matched_scenes=["raid"], failure_reason=None),
+                    SimpleNamespace(scene="raid", matched_keywords={}, matched_scenes=["raid"], failure_reason=None),
+                ],
+            ):
+                result = analyze_video(video_path=video_path, engine=engine, video_source=source)
+
+        self.assertEqual(len(result.events), 3)
+        self.assertFalse(result.events[0].scene_payload["brightness_recovery_triggered"])
+        self.assertTrue(result.events[1].scene_payload["brightness_recovery_triggered"])
+        self.assertFalse(result.events[2].scene_payload["brightness_recovery_triggered"])
 
     def test_video_pipeline_with_fake_source_feeds_session_aggregator(self) -> None:
         frames = [

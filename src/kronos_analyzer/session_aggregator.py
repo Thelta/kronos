@@ -40,6 +40,7 @@ class RaidTimelineSample:
     boss_remaining_hp: int | None
     boss_total_hp_observed: int | None
     boss_total_hp_canonical: int | None
+    cost: int | None
     session_damage: int | None
     segment_damage: int | None
 
@@ -408,6 +409,7 @@ def _build_raid_sample(
         boss_remaining_hp=raid.boss_remaining_hp if raid is not None else None,
         boss_total_hp_observed=raid.boss_total_hp if raid is not None else None,
         boss_total_hp_canonical=None,
+        cost=raid.cost if raid is not None else None,
         session_damage=None,
         segment_damage=None,
     )
@@ -451,11 +453,12 @@ def _should_replace_duplicate(previous_sample: RaidTimelineSample, new_sample: R
     return new_score >= previous_score
 
 
-def _sample_quality_score(sample: RaidTimelineSample) -> tuple[int, int, int]:
+def _sample_quality_score(sample: RaidTimelineSample) -> tuple[int, int, int, int]:
     has_timer = int(sample.raid_timer_ms is not None)
     has_any_hp = int(sample.boss_remaining_hp is not None or sample.boss_total_hp_observed is not None)
     has_both_hp = int(sample.boss_remaining_hp is not None and sample.boss_total_hp_observed is not None)
-    return has_timer, has_any_hp, has_both_hp
+    has_cost = int(sample.cost is not None)
+    return has_timer, has_any_hp, has_both_hp, has_cost
 
 
 def _finalize_segments(

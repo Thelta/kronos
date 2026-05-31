@@ -12,9 +12,12 @@ sys.path.insert(0, str(ROOT / "packages" / "kronos-shared" / "src"))
 from kronos_shared import (  # noqa: E402
     GalleryArtifact,
     GalleryPrototype,
+    SkillClassificationRow,
     SyntheticClassificationRow,
+    load_skill_rows,
     load_gallery_artifact,
     load_synthetic_rows,
+    save_skill_rows,
     save_gallery_artifact,
     save_synthetic_rows,
 )
@@ -62,6 +65,41 @@ class SharedArtifactTests(unittest.TestCase):
             save_synthetic_rows(path, rows)
             loaded = load_synthetic_rows(path)
         self.assertEqual(loaded[0].subset, "train_query")
+
+    def test_skill_rows_accept_extra_fields_and_identity_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "skill_manifest.jsonl"
+            path.write_text(
+                '{"image_path":"images/sample.jpg","split":"train","mode":"classification",'
+                '"character_id":"fallback","skill_card_id":null,"assist":false,"seed":1,'
+                '"background_kind":"gradient","card_box":[0,0,10,10],"portrait_box":[0,0,8,8],'
+                '"card_source":"skill","extra_field":"ignored"}\n',
+                encoding="utf-8",
+            )
+            loaded = load_skill_rows(path)
+        self.assertEqual(loaded[0].subset, "train")
+        self.assertEqual(loaded[0].identity_key, "fallback")
+
+    def test_skill_rows_round_trip(self) -> None:
+        rows = [
+            SkillClassificationRow(
+                image_path="images/sample.jpg",
+                subset="train_query",
+                mode="classification",
+                character_id="Skill_Portrait_Airi",
+                skill_card_id="Skill_Portrait_Airi",
+                assist=False,
+                seed=1,
+                background_kind="gradient",
+                card_box=[0, 0, 10, 10],
+                portrait_box=[0, 0, 8, 8],
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "skill_manifest.jsonl"
+            save_skill_rows(path, rows)
+            loaded = load_skill_rows(path)
+        self.assertEqual(loaded[0].identity_key, "Skill_Portrait_Airi")
 
 
 if __name__ == "__main__":

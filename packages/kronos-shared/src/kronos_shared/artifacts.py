@@ -41,9 +41,11 @@ class RecognitionMatch:
 @dataclass(slots=True)
 class RecognitionResult:
     character_id: str
-    similarity: float
-    star_value: int
-    assist: bool
+    similarity: float | None
+    star_value: int | None
+    assist: bool | None
+    predicted_empty: bool = False
+    predicted_empty_probability: float = 0.0
     top_matches: list[RecognitionMatch] = field(default_factory=list)
 
 

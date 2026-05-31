@@ -105,12 +105,18 @@ def build_model(config: Any, num_classes: int) -> Any:
                 global_pool="avg",
             )
             feature_dim = int(getattr(self.backbone, "head_hidden_size", self.backbone.num_features))
+            hidden = int(config.model.roi_hidden_dim)
+            empty_hidden = hidden // 2 if hidden >= 2 else 1
             self.embedding_layer = nn.Linear(feature_dim, config.model.embedding_dim, bias=False)
             self.embedding_bn = nn.BatchNorm1d(config.model.embedding_dim)
+            self.empty_head = nn.Sequential(
+                nn.Linear(feature_dim, empty_hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(empty_hidden, 1),
+            )
             self.star_roi = validate_roi("model.star_roi", config.model.star_roi)
             self.assist_roi = validate_roi("model.assist_roi", config.model.assist_roi)
             self.roi_input_size = int(config.model.roi_input_size)
-            hidden = int(config.model.roi_hidden_dim)
             self.star_box_expand_x = float(config.model.star_box_expand_x)
             self.star_box_expand_y = float(config.model.star_box_expand_y)
             self.star_box_train_prob = float(config.model.star_box_train_prob)
@@ -310,6 +316,7 @@ def build_model(config: Any, num_classes: int) -> Any:
             outputs = {
                 "embedding": normalized_embedding,
                 "identity_logits": identity_logits,
+                "empty_logits": self.empty_head(pooled_features).squeeze(1),
                 "star_state_logits": self.star_head(star_features),
                 "assist_logits": self.assist_head(assist_features).squeeze(1),
             }

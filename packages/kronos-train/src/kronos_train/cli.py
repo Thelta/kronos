@@ -5,6 +5,14 @@ from pathlib import Path
 
 from .pipeline import dump_star_crops, evaluate_checkpoint, export_gallery, predict_image, train_from_config
 from .prep import main as prepare_manifest_main
+from .skill_pipeline import (
+    analyze_skill_confusions,
+    evaluate_skill_checkpoint,
+    export_skill_gallery,
+    predict_skill_image,
+    train_skill_from_config,
+)
+from .skill_training_config import load_skill_config
 from .training_config import load_config
 from .yolo_config import load_config as load_yolo_config
 from .yolo_pipeline import prepare_yolo_dataset, train_yolo_from_config
@@ -61,6 +69,43 @@ def build_parser() -> argparse.ArgumentParser:
     predict_parser.add_argument("--pad-mode", choices=("edge", "reflect", "constant"), default="edge")
     predict_parser.add_argument("--dump-dir", type=Path, default=None)
     predict_parser.set_defaults(handler=handle_predict_image)
+
+    skill_train_parser = subparsers.add_parser("train-skill", help="Train ArcFace skill classifier with an empty gate.")
+    skill_train_parser.add_argument("--config", type=Path, required=True)
+    skill_train_parser.add_argument("--override", action="append", default=[])
+    skill_train_parser.add_argument("--device", default="cuda")
+    skill_train_parser.add_argument("--dry-run", action="store_true")
+    skill_train_parser.set_defaults(handler=handle_train_skill)
+
+    skill_evaluate_parser = subparsers.add_parser("evaluate-skill", help="Evaluate skill retrieval and empty-gate behavior from a checkpoint.")
+    skill_evaluate_parser.add_argument("--checkpoint", type=Path, required=True)
+    skill_evaluate_parser.add_argument("--subset", default="test_query")
+    skill_evaluate_parser.add_argument("--device", default="cuda")
+    skill_evaluate_parser.add_argument("--output", type=Path, default=None)
+    skill_evaluate_parser.add_argument("--canonical-manifest", type=Path, default=None)
+    skill_evaluate_parser.set_defaults(handler=handle_evaluate_skill)
+
+    skill_confusions_parser = subparsers.add_parser("analyze-skill-confusions", help="Aggregate which skill identities are nearest competitors for a checkpoint.")
+    skill_confusions_parser.add_argument("--checkpoint", type=Path, required=True)
+    skill_confusions_parser.add_argument("--subset", default="test_query")
+    skill_confusions_parser.add_argument("--device", default="cuda")
+    skill_confusions_parser.add_argument("--output", type=Path, default=None)
+    skill_confusions_parser.add_argument("--canonical-manifest", type=Path, default=None)
+    skill_confusions_parser.add_argument("--topn", type=int, default=10)
+    skill_confusions_parser.set_defaults(handler=handle_analyze_skill_confusions)
+
+    skill_export_parser = subparsers.add_parser("export-skill-gallery", help="Export skill gallery prototypes from a checkpoint.")
+    skill_export_parser.add_argument("--checkpoint", type=Path, required=True)
+    skill_export_parser.add_argument("--output", type=Path, required=True)
+    skill_export_parser.add_argument("--device", default="cuda")
+    skill_export_parser.set_defaults(handler=handle_export_skill_gallery)
+
+    skill_predict_parser = subparsers.add_parser("predict-skill-image", help="Run one image through a skill checkpoint and print predictions.")
+    skill_predict_parser.add_argument("--checkpoint", type=Path, required=True)
+    skill_predict_parser.add_argument("--image", type=Path, required=True)
+    skill_predict_parser.add_argument("--device", default="cuda")
+    skill_predict_parser.add_argument("--topk", type=int, default=5)
+    skill_predict_parser.set_defaults(handler=handle_predict_skill_image)
 
     yolo_prepare_parser = subparsers.add_parser("prepare-yolo", help="Prepare the merged YOLO26 dataset from synthetic and reviewed-real inputs.")
     yolo_prepare_parser.add_argument("--config", type=Path, required=True)
@@ -121,6 +166,32 @@ def handle_dump_star_crops(args: argparse.Namespace) -> int:
 
 def handle_predict_image(args: argparse.Namespace) -> int:
     predict_image(args.checkpoint, args.image, args.device, args.topk, args.pad_ratio, args.pad_mode, args.dump_dir)
+    return 0
+
+
+def handle_train_skill(args: argparse.Namespace) -> int:
+    config = load_skill_config(args.config, args.override)
+    train_skill_from_config(config, args.device, dry_run=args.dry_run)
+    return 0
+
+
+def handle_evaluate_skill(args: argparse.Namespace) -> int:
+    evaluate_skill_checkpoint(args.checkpoint, args.subset, args.device, args.output, args.canonical_manifest)
+    return 0
+
+
+def handle_analyze_skill_confusions(args: argparse.Namespace) -> int:
+    analyze_skill_confusions(args.checkpoint, args.subset, args.device, args.output, args.canonical_manifest, args.topn)
+    return 0
+
+
+def handle_export_skill_gallery(args: argparse.Namespace) -> int:
+    export_skill_gallery(args.checkpoint, args.output, args.device)
+    return 0
+
+
+def handle_predict_skill_image(args: argparse.Namespace) -> int:
+    predict_skill_image(args.checkpoint, args.image, args.device, args.topk)
     return 0
 
 

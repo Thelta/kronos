@@ -63,6 +63,7 @@ class OptimizerConfig:
 @dataclass
 class LossConfig:
     identity_weight: float = 1.0
+    empty_weight: float = 0.2
     star_weight: float = 0.3
     star_color_weight: float = 0.2
     assist_weight: float = 0.2
@@ -75,6 +76,7 @@ class TrainerConfig:
     output_dir: str = "training_runs/kronos_arcface"
     resume_from: str | None = None
     seed: int = 7
+    patience: int = 0
 
 
 @dataclass

@@ -9,6 +9,8 @@ from typing import Sequence
 
 from kronos_shared import SyntheticClassificationRow, load_synthetic_rows, save_synthetic_rows
 
+from .data import ensure_empty_examples, is_empty_row
+
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Repartition a shittim synthetic manifest for closed-set retrieval.")
@@ -47,9 +49,14 @@ def repartition_rows(
     val_count: int,
     test_count: int,
 ) -> list[SyntheticClassificationRow]:
+    ensure_empty_examples(rows)
     required = gallery_count + train_count + val_count + test_count
     grouped: dict[str, list[SyntheticClassificationRow]] = {}
+    empty_rows: list[SyntheticClassificationRow] = []
     for row in rows:
+        if is_empty_row(row):
+            empty_rows.append(row)
+            continue
         grouped.setdefault(row.character_id, []).append(row)
 
     rng = random.Random(seed)
@@ -81,6 +88,9 @@ def repartition_rows(
         for subset, subset_rows in subsets:
             for row in subset_rows:
                 prepared.append(replace(row, subset=subset))
+
+    for row in empty_rows:
+        prepared.append(replace(row, subset="train_query"))
 
     return prepared
 

@@ -11,9 +11,12 @@ from .raid import (
     RaidResult,
     bounds_from_box,
     extract_raid_fields,
+    find_cost_label_line,
+    find_cost_value_line,
     extract_timer_value,
     find_boss_hp_line,
     find_timer_line,
+    parse_cost_value,
     parse_hp_pair,
 )
 from .schemas import OCRDump
@@ -24,6 +27,7 @@ logger = logging.getLogger(__name__)
 _EMA_ALPHA = 0.2
 _MIN_SAMPLES_FOR_REOCR = 3
 _CROP_PADDING = 15
+BRIGHTNESS_THRESHOLD = 90.0
 
 
 @dataclass
@@ -60,9 +64,11 @@ class RaidFieldTracker:
 class RaidTracker:
     hp_tracker: RaidFieldTracker = field(default_factory=RaidFieldTracker)
     timer_tracker: RaidFieldTracker = field(default_factory=RaidFieldTracker)
+    cost_tracker: RaidFieldTracker = field(default_factory=RaidFieldTracker)
     prev_remaining_hp: int | None = None
     prev_total_hp: int | None = None
     prev_timer_ms: int | None = None
+    brightness_was_below_threshold: bool = False
 
     def extract(
         self, dump: OCRDump, image_array: Any, engine: OCREngine
@@ -78,6 +84,7 @@ class RaidTracker:
 
         hp_problem = self._detect_hp_problem(result)
         timer_problem = self._detect_timer_problem(result)
+        cost_problem = self._detect_cost_problem(result)
 
         # Attempt re-OCR for HP if needed
         if hp_problem is not None and self.hp_tracker.sample_count >= _MIN_SAMPLES_FOR_REOCR:
@@ -89,6 +96,7 @@ class RaidTracker:
                     boss_remaining_hp=remaining,
                     boss_total_hp=total,
                     timer=result.timer,
+                    cost=result.cost,
                 )
                 hp_problem = self._detect_hp_problem(result)
 
@@ -101,8 +109,21 @@ class RaidTracker:
                     boss_remaining_hp=result.boss_remaining_hp,
                     boss_total_hp=result.boss_total_hp,
                     timer=reocr_timer,
+                    cost=result.cost,
                 )
                 timer_problem = self._detect_timer_problem(result)
+
+        if cost_problem is not None and self.cost_tracker.sample_count >= _MIN_SAMPLES_FOR_REOCR:
+            logger.info("Cost anomaly detected: %s; attempting re-OCR", cost_problem)
+            reocr_cost = self._reocr_cost(image_array, engine)
+            if reocr_cost is not None:
+                result = RaidResult(
+                    boss_remaining_hp=result.boss_remaining_hp,
+                    boss_total_hp=result.boss_total_hp,
+                    timer=result.timer,
+                    cost=reocr_cost,
+                )
+                cost_problem = self._detect_cost_problem(result)
 
         # Update bbox trackers on successful reads
         if hp_problem is None:
@@ -121,6 +142,15 @@ class RaidTracker:
                     AxisAlignedBox(left=left, top=top, right=right, bottom=bottom)
                 )
 
+        if cost_problem is None and result.cost is not None:
+            cost_label_line = find_cost_label_line(dump.lines)
+            cost_line = find_cost_value_line(dump.lines, cost_label_line)
+            if cost_line is not None and cost_line.box:
+                left, top, right, bottom = bounds_from_box(cost_line.box)
+                self.cost_tracker.update_box(
+                    AxisAlignedBox(left=left, top=top, right=right, bottom=bottom)
+                )
+
         # Update previous values for next-frame comparison
         if result.boss_remaining_hp is not None:
             self.prev_remaining_hp = result.boss_remaining_hp
@@ -130,7 +160,14 @@ class RaidTracker:
         if timer_ms is not None:
             self.prev_timer_ms = timer_ms
 
-        return result
+        brightness_recovery_triggered = self._update_brightness_state(image_array)
+        return RaidResult(
+            boss_remaining_hp=result.boss_remaining_hp,
+            boss_total_hp=result.boss_total_hp,
+            timer=result.timer,
+            cost=result.cost,
+            brightness_recovery_triggered=brightness_recovery_triggered,
+        )
 
     def _detect_hp_problem(self, result: RaidResult) -> str | None:
         if result.boss_remaining_hp is None:
@@ -166,6 +203,21 @@ class RaidTracker:
             return False
         return (timer_ms - self.prev_timer_ms) >= TEAM_RESET_THRESHOLD_MS
 
+    def _detect_cost_problem(self, result: RaidResult) -> str | None:
+        if result.cost is None:
+            return "cost_parse_failure"
+        return None
+
+    def _update_brightness_state(self, image_array: Any) -> bool:
+        brightness = _mean_frame_brightness(image_array)
+        if brightness < BRIGHTNESS_THRESHOLD:
+            self.brightness_was_below_threshold = True
+            return False
+        if self.brightness_was_below_threshold:
+            self.brightness_was_below_threshold = False
+            return True
+        return False
+
     def _reocr_hp(
         self, image_array: Any, engine: OCREngine
     ) -> tuple[int | None, int | None] | None:
@@ -197,6 +249,20 @@ class RaidTracker:
         timer = extract_timer_value(lines[0].text)
         return timer if timer else None
 
+    def _reocr_cost(self, image_array: Any, engine: OCREngine) -> int | None:
+        box = self.cost_tracker.avg_box
+        if box is None:
+            return None
+        crop = _crop_from_box(image_array, box)
+        if crop is None:
+            return None
+        lines = engine.recognize_crops([crop], profile="default")
+        for line in lines:
+            cost = parse_cost_value(line.text)
+            if cost is not None:
+                return cost
+        return None
+
 
 def _crop_from_box(image_array: Any, box: AxisAlignedBox) -> Any:
     h, w = image_array.shape[:2]
@@ -207,3 +273,14 @@ def _crop_from_box(image_array: Any, box: AxisAlignedBox) -> Any:
     if right <= left or bottom <= top:
         return None
     return image_array[top:bottom, left:right]
+
+
+def _mean_frame_brightness(image_array: Any) -> float:
+    if image_array.ndim == 2:
+        return float(np.mean(image_array))
+    if image_array.ndim == 3 and image_array.shape[2] >= 3:
+        b = image_array[..., 0].astype(np.float32)
+        g = image_array[..., 1].astype(np.float32)
+        r = image_array[..., 2].astype(np.float32)
+        return float(np.mean((0.114 * b) + (0.587 * g) + (0.299 * r)))
+    return float(np.mean(image_array))

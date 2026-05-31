@@ -45,6 +45,7 @@
   },
   "losses": {
     "identity_weight": 1.0,
+    "empty_weight": 0.2,
     "star_weight": 0.3,
     "star_color_weight": 0.2,
     "assist_weight": 0.2

@@ -3,7 +3,6 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import numpy as np
-import pytest
 
 from kronos_analyzer.raid import RaidResult
 from kronos_analyzer.raid_tracker import (
@@ -18,17 +17,29 @@ from kronos_analyzer.schemas import OCRDump, OCRLine
 def _make_dump(
     hp_text: str = "50000/100000",
     timer_text: str = "03:00.000",
+    cost_text: str | None = "3",
     hp_box: list[list[float]] | None = None,
     timer_box: list[list[float]] | None = None,
+    cost_label_box: list[list[float]] | None = None,
+    cost_box: list[list[float]] | None = None,
 ) -> OCRDump:
     if hp_box is None:
         hp_box = [[1200, 50], [1360, 50], [1360, 80], [1200, 80]]
     if timer_box is None:
         timer_box = [[2200, 50], [2300, 50], [2300, 80], [2200, 80]]
+    if cost_label_box is None:
+        cost_label_box = [[1550, 1280], [1625, 1280], [1625, 1316], [1550, 1316]]
+    if cost_box is None:
+        cost_box = [[1560, 1314], [1608, 1314], [1608, 1365], [1560, 1365]]
     lines = [
         OCRLine(text=hp_text, score=0.95, box=hp_box),
         OCRLine(text=timer_text, score=0.95, box=timer_box),
     ]
+    if cost_text is not None:
+        lines.extend([
+            OCRLine(text="COST", score=0.99, box=cost_label_box),
+            OCRLine(text=cost_text, score=0.99, box=cost_box),
+        ])
     return OCRDump(
         image="test.png",
         line_count=len(lines),
@@ -55,10 +66,12 @@ class TestColdStart:
         assert r1.boss_remaining_hp == 50000
         assert r1.boss_total_hp == 100000
         assert r1.timer == "03:00.000"
+        assert r1.cost == 3
 
         r2 = tracker.extract(_make_dump("45000/100000", "02:55.000"), image, engine)
         assert r2.boss_remaining_hp == 45000
         assert r2.timer == "02:55.000"
+        assert r2.cost == 3
 
         engine.recognize_crops.assert_not_called()
 
@@ -214,6 +227,132 @@ class TestTeamChange:
         # Bbox trackers should still have samples
         assert tracker.hp_tracker.sample_count >= 3
         assert tracker.timer_tracker.sample_count >= 3
+
+
+class TestCostTracking:
+    def test_reocr_triggered_on_invalid_cost(self):
+        tracker = RaidTracker()
+        engine = _make_engine()
+        image = _make_image()
+
+        for cost in ["3", "4", "5"]:
+            tracker.extract(_make_dump("50000/100000", "03:00.000", cost), image, engine)
+
+        engine.recognize_crops.return_value = [
+            OCRLine(text="-11", score=0.9, box=[])
+        ]
+        result = tracker.extract(
+            _make_dump("49000/100000", "02:59.000", "12"), image, engine
+        )
+
+        engine.recognize_crops.assert_called_once()
+        assert result.cost == -11
+
+    def test_invalid_cost_does_not_update_tracker_box(self):
+        tracker = RaidTracker()
+        engine = _make_engine()
+        image = _make_image()
+
+        for cost in ["3", "4", "5"]:
+            tracker.extract(_make_dump("50000/100000", "03:00.000", cost), image, engine)
+
+        assert tracker.cost_tracker.sample_count == 3
+        engine.recognize_crops.return_value = [
+            OCRLine(text="garbled", score=0.1, box=[])
+        ]
+        result = tracker.extract(
+            _make_dump("49000/100000", "02:59.000", "garbled"), image, engine
+        )
+
+        assert result.cost is None
+        assert tracker.cost_tracker.sample_count == 3
+
+    def test_cost_can_jump_without_triggering_anomaly(self):
+        tracker = RaidTracker()
+        engine = _make_engine()
+        image = _make_image()
+
+        result_1 = tracker.extract(_make_dump("50000/100000", "03:00.000", "0"), image, engine)
+        result_2 = tracker.extract(_make_dump("49000/100000", "02:59.000", "11"), image, engine)
+        result_3 = tracker.extract(_make_dump("48000/100000", "02:58.000", "-11"), image, engine)
+
+        assert result_1.cost == 0
+        assert result_2.cost == 11
+        assert result_3.cost == -11
+        engine.recognize_crops.assert_not_called()
+
+
+class TestBrightnessRecovery:
+    def test_dark_then_bright_triggers_once(self):
+        tracker = RaidTracker()
+        engine = _make_engine()
+
+        dark = np.full((32, 32, 3), 80, dtype=np.uint8)
+        bright = np.full((32, 32, 3), 120, dtype=np.uint8)
+
+        first = tracker.extract(_make_dump(), dark, engine)
+        second = tracker.extract(_make_dump(timer_text="02:59.000"), bright, engine)
+        third = tracker.extract(_make_dump(timer_text="02:58.000"), bright, engine)
+
+        assert first.brightness_recovery_triggered is False
+        assert second.brightness_recovery_triggered is True
+        assert third.brightness_recovery_triggered is False
+
+    def test_multiple_dark_frames_arm_single_recovery(self):
+        tracker = RaidTracker()
+        engine = _make_engine()
+
+        dark = np.full((32, 32, 3), 70, dtype=np.uint8)
+        bright = np.full((32, 32, 3), 140, dtype=np.uint8)
+
+        first = tracker.extract(_make_dump(), dark, engine)
+        second = tracker.extract(_make_dump(timer_text="02:59.000"), dark, engine)
+        third = tracker.extract(_make_dump(timer_text="02:58.000"), bright, engine)
+
+        assert first.brightness_recovery_triggered is False
+        assert second.brightness_recovery_triggered is False
+        assert third.brightness_recovery_triggered is True
+
+    def test_bright_to_bright_never_triggers(self):
+        tracker = RaidTracker()
+        engine = _make_engine()
+        bright = np.full((32, 32, 3), 120, dtype=np.uint8)
+
+        first = tracker.extract(_make_dump(), bright, engine)
+        second = tracker.extract(_make_dump(timer_text="02:59.000"), bright, engine)
+
+        assert first.brightness_recovery_triggered is False
+        assert second.brightness_recovery_triggered is False
+
+    def test_dark_to_dark_never_triggers(self):
+        tracker = RaidTracker()
+        engine = _make_engine()
+        dark = np.full((32, 32, 3), 60, dtype=np.uint8)
+
+        first = tracker.extract(_make_dump(), dark, engine)
+        second = tracker.extract(_make_dump(timer_text="02:59.000"), dark, engine)
+
+        assert first.brightness_recovery_triggered is False
+        assert second.brightness_recovery_triggered is False
+
+    def test_new_recovery_requires_new_dark_period(self):
+        tracker = RaidTracker()
+        engine = _make_engine()
+
+        dark = np.full((32, 32, 3), 75, dtype=np.uint8)
+        bright = np.full((32, 32, 3), 130, dtype=np.uint8)
+
+        first = tracker.extract(_make_dump(), dark, engine)
+        second = tracker.extract(_make_dump(timer_text="02:59.000"), bright, engine)
+        third = tracker.extract(_make_dump(timer_text="02:58.000"), bright, engine)
+        fourth = tracker.extract(_make_dump(timer_text="02:57.000"), dark, engine)
+        fifth = tracker.extract(_make_dump(timer_text="02:56.000"), bright, engine)
+
+        assert first.brightness_recovery_triggered is False
+        assert second.brightness_recovery_triggered is True
+        assert third.brightness_recovery_triggered is False
+        assert fourth.brightness_recovery_triggered is False
+        assert fifth.brightness_recovery_triggered is True
 
 
 class TestCropFromBox:

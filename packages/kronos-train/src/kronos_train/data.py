@@ -7,6 +7,9 @@ from typing import Any
 from kronos_shared import SyntheticClassificationRow, load_synthetic_rows
 
 
+EMPTY_CHARACTER_ID = "empty"
+
+
 def load_rows(manifest_path: Path) -> list[SyntheticClassificationRow]:
     rows = load_synthetic_rows(manifest_path)
     if not rows:
@@ -21,8 +24,21 @@ def resolve_image_path(dataset_root: Path, image_path: str) -> Path:
     return dataset_root / path
 
 
+def is_empty_row(row: SyntheticClassificationRow) -> bool:
+    return bool(row.empty) or row.character_id.strip().lower() == EMPTY_CHARACTER_ID
+
+
+def ensure_empty_examples(rows: list[SyntheticClassificationRow]) -> None:
+    if not any(is_empty_row(row) for row in rows):
+        raise ValueError("Manifest must contain at least one empty-labeled example.")
+
+
 def build_identity_index(rows: list[SyntheticClassificationRow]) -> list[str]:
-    return sorted({row.character_id for row in rows})
+    ensure_empty_examples(rows)
+    identities = sorted({row.character_id for row in rows if not is_empty_row(row)})
+    if not identities:
+        raise ValueError("Manifest must contain at least one non-empty identity.")
+    return identities
 
 
 def filter_rows(rows: list[SyntheticClassificationRow], subset: str) -> list[SyntheticClassificationRow]:
@@ -59,16 +75,21 @@ def prepare_runtime_subsets(
     gallery_count_per_identity: int,
     seed: int,
 ) -> dict[str, list[SyntheticClassificationRow]]:
+    ensure_empty_examples(rows)
     if supports_gallery_subset(rows, gallery_subset):
         return {
-            "gallery": filter_rows(rows, gallery_subset),
+            "gallery": [row for row in filter_rows(rows, gallery_subset) if not is_empty_row(row)],
             "train_query": filter_rows(rows, "train_query") or filter_rows(rows, train_subset),
             "val_query": filter_rows(rows, "val_query") or filter_rows(rows, val_subset),
             "test_query": filter_rows(rows, "test_query") or filter_rows(rows, test_subset),
         }
 
+    train_rows = filter_rows(rows, train_subset)
+    empty_train_rows = [row for row in train_rows if is_empty_row(row)]
     grouped_train: dict[str, list[SyntheticClassificationRow]] = {}
-    for row in filter_rows(rows, train_subset):
+    for row in train_rows:
+        if is_empty_row(row):
+            continue
         grouped_train.setdefault(row.character_id, []).append(row)
 
     rng = random.Random(seed)
@@ -88,6 +109,7 @@ def prepare_runtime_subsets(
         gallery_rows.extend(gallery_selected)
         train_query_rows.extend(remaining)
 
+    train_query_rows.extend(empty_train_rows)
     return {
         "gallery": gallery_rows,
         "train_query": train_query_rows,
@@ -141,6 +163,20 @@ def build_transforms(image_size: int) -> Any:
     )
 
 
+def build_train_transforms(image_size: int) -> Any:
+    from torchvision import transforms
+
+    return transforms.Compose(
+        [
+            transforms.Resize((image_size, image_size)),
+            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.02),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            transforms.RandomErasing(p=0.15, scale=(0.02, 0.12)),
+        ]
+    )
+
+
 def star_color_to_index(star_color: str) -> int:
     normalized = star_color.strip().lower()
     if normalized == "yellow":
@@ -160,6 +196,12 @@ def build_star_slot_indices(*, star_value: int, star_color: str) -> list[int]:
 
 def build_star_state_index(*, star_value: int, star_color: str) -> int:
     return star_color_to_index(star_color) * 5 + (int(star_value) - 1)
+
+
+def is_valid_box(box: list[int] | None) -> bool:
+    if box is None or len(box) != 4:
+        return False
+    return float(box[2]) > float(box[0]) and float(box[3]) > float(box[1])
 
 
 class SyntheticCardDataset:
@@ -190,6 +232,7 @@ class SyntheticCardDataset:
         from PIL import Image
 
         row = self.rows[index]
+        empty = is_empty_row(row)
         image = Image.open(resolve_image_path(self.dataset_root, row.image_path)).convert("RGB")
         width, height = image.size
         image = degrade_tiny_card_image(
@@ -207,24 +250,27 @@ class SyntheticCardDataset:
             float(card_box[2]) * scale_x,
             float(card_box[3]) * scale_y,
         ]
-        if row.star_box is not None:
-            star_box = row.star_box
+        if empty or not is_valid_box(row.star_box):
+            scaled_star_box = [float("nan"), float("nan"), float("nan"), float("nan")]
+        else:
+            star_box = row.star_box or [0, 0, 0, 0]
             scaled_star_box = [
                 float(star_box[0]) * scale_x,
                 float(star_box[1]) * scale_y,
                 float(star_box[2]) * scale_x,
                 float(star_box[3]) * scale_y,
             ]
-        else:
-            scaled_star_box = [float("nan"), float("nan"), float("nan"), float("nan")]
         return {
             "image": self.transform(image),
-            "identity_index": self.character_to_index[row.character_id],
-            "star_index": int(row.star_value) - 1,
-            "star_color_index": star_color_to_index(row.star_color),
-            "star_state_index": build_star_state_index(star_value=row.star_value, star_color=row.star_color),
-            "star_slot_indices": build_star_slot_indices(star_value=row.star_value, star_color=row.star_color),
-            "assist": 1.0 if row.assist else 0.0,
+            "identity_index": -1 if empty else self.character_to_index[row.character_id],
+            "empty_label": 1.0 if empty else 0.0,
+            "star_index": 0 if empty else int(row.star_value) - 1,
+            "star_color_index": 0 if empty else star_color_to_index(row.star_color or "yellow"),
+            "star_state_index": 0 if empty else build_star_state_index(star_value=int(row.star_value), star_color=row.star_color or "yellow"),
+            "star_slot_indices": [0, 0, 0, 0, 0]
+            if empty
+            else build_star_slot_indices(star_value=int(row.star_value), star_color=row.star_color or "yellow"),
+            "assist": 0.0 if empty else (1.0 if row.assist else 0.0),
             "card_box": scaled_card_box,
             "star_box": scaled_star_box,
             "row": row,
@@ -234,9 +280,12 @@ class SyntheticCardDataset:
 def collate_samples(batch: list[dict[str, Any]]) -> dict[str, Any]:
     import torch
 
+    identity_indices = torch.tensor([item["identity_index"] for item in batch], dtype=torch.long)
     return {
         "images": torch.stack([item["image"] for item in batch]),
-        "identity_indices": torch.tensor([item["identity_index"] for item in batch], dtype=torch.long),
+        "identity_indices": identity_indices,
+        "empty_labels": torch.tensor([item["empty_label"] for item in batch], dtype=torch.float32),
+        "non_empty_mask": identity_indices >= 0,
         "star_indices": torch.tensor([item["star_index"] for item in batch], dtype=torch.long),
         "star_color_indices": torch.tensor([item["star_color_index"] for item in batch], dtype=torch.long),
         "star_state_indices": torch.tensor([item["star_state_index"] for item in batch], dtype=torch.long),
